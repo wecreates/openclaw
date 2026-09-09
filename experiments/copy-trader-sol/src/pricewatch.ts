@@ -71,6 +71,7 @@ async function evaluatePosition(
 
   const pnlPct = (currentPrice - entry) / entry;
   const drawdownFromPeak = (peak - currentPrice) / peak;
+  const ageHours = (Date.now() - p.openedAt) / 3_600_000;
 
   let reason: string | null = null;
   if (config.stopLossPct > 0 && pnlPct <= -config.stopLossPct) {
@@ -88,6 +89,11 @@ async function evaluatePosition(
     pnlPct >= config.takeProfitPct
   ) {
     reason = `take-profit +${(pnlPct * 100).toFixed(1)}%`;
+  } else if (
+    config.maxPositionAgeHours > 0 &&
+    ageHours >= config.maxPositionAgeHours
+  ) {
+    reason = `max-age ${ageHours.toFixed(1)}h`;
   }
   if (!reason) return;
 

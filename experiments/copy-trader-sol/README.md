@@ -1,105 +1,132 @@
 # copy-trader-sol
 
-Solana copy-trading bot. Watches wallets you follow, mirrors their DEX swaps through Jupiter, protects downside with stop-loss + trailing take-profit, drops leaders who cost you money, and shows a live dashboard.
+Solana copy-trading bot. Watches wallets you follow, mirrors their DEX swaps through Jupiter (with optional Jito bundles for MEV protection), gates every trade through nine safety checks, exits with independent stop-loss + trailing take-profit + max-age, drops leaders who cost you money, and exposes a live dashboard, Prometheus metrics, and a CLI.
 
 ## Architecture
 
 ```
-Helius WS (auto-reconnect) → parser → risk gate → Jupiter v6 swap → sqlite
-      ↑                                       ↑                        ↓
-followed wallets              rug check · liquidity            price watcher
-      ↑                       min leader size                  · stop-loss
-GMGN top wallets              blacklist · kill switch          · trailing TP
-                              muted leaders                      · exits
-                                                                    ↓
-                                                            leader scorer
-                                                                    ↓
-                                                            auto-mute losers
+   Helius WS  ─►  parser  ─►  ┌─── mute + kill-switch + daily-loss + max-positions
+(auto-reconnect)               │
+                               ├── blacklist / leader-dust / mint-cooldown / leader-cooldown
+                               │
+                               ├── token-age gate (skip mints < N minutes old)
+                               │
+                               ├── rug check (mint authority · freeze authority · top holder)
+                               │
+                               ├── liquidity probe (Jupiter 0.1-SOL impact)
+                               │
+                               └── consensus (N distinct leaders in a rolling window)
+                                          │
+                                          ▼
+                                     Jupiter v6 quote
+                                          │
+                                          ▼
+                              ┌── Jito bundle (+tip) ─┐
+                              └── multi-RPC race     ─┴──► confirm
+                                          │
+                                          ▼
+                                  sqlite: positions
+                                          │
+                                          ▼
+             ┌────────────────────────────┼─────────────────────────────┐
+             │                            │                             │
+       price watcher                  scoring                    dashboard
+   (stop / trail / age)     (auto-mute losing leaders)     · metrics · CLI · CSV
 ```
 
-- **Watcher** — `logsSubscribe({ mentions: [wallet] })` with a 15s heartbeat and full resubscribe on RPC failure.
-- **Parser** — diffs the leader's pre/post SOL and SPL balances, DEX-agnostic. Returns `leaderPre/PostTokenAmount` so partial sells scale correctly.
-- **Rug check** — before every buy: mint authority must be null (no printing), freeze authority must be null (no wallet freeze), top holder <40%.
-- **Execution** — Jupiter v6 aggregator with priority fee; retrying HTTP wrapper handles transient 5xx/timeouts.
-- **Reconciliation on startup** — walks every open position and syncs its `amount_raw` with the wallet's on-chain balance (drops phantoms, adjusts partials).
-- **Exits** — 20s price poll per open position; independent stop-loss + trailing take-profit.
-- **Auto-mute** — after N closed sells, if a leader's net PnL is negative AND (winrate below floor OR loss streak), they're muted and won't be copied again.
-- **Kill switch** — create `~/.copy-trader-kill`; no new trades until you delete it.
-- **Dashboard** — http://127.0.0.1:3000, 5s refresh.
-- **CLI** — `pnpm cli status | positions | trades | leaders | mute | unmute | mutes`.
+## Feature list
+
+- **Signal** — Helius `logsSubscribe` per followed wallet, 15s RPC heartbeat, full resubscribe on failure.
+- **Parser** — DEX-agnostic pre/post balance diff. Returns leader's pre-token balance so partial sells scale correctly.
+- **Execution** — Jupiter v6 aggregator. Priority fee auto-doubles on retry up to a cap. Optional Jito bundle path with tip. Optional multi-RPC racing via `EXTRA_RPC_URLS`.
+- **Gates** — muted leaders, kill switch, daily loss cap, max concurrent positions, blacklist, min leader notional, per-mint re-entry cooldown, per-leader re-buy cooldown, min token age (with strict mode), rug check, liquidity probe, N-leader consensus.
+- **Exits** — independent 20s price poll: stop-loss, take-profit trigger + trailing stop, max-position-age hours.
+- **Auto-mute** — after N closed sells, if leader's net PnL negative AND (winrate below floor OR loss streak), auto-mute.
+- **Startup reconcile** — every DB position synced with on-chain balance (drops phantoms, adjusts partials).
+- **Discovery** — pulls top 7-day wallets from GMGN's public rank endpoint when `AUTO_DISCOVER=1`.
+- **Alerts** — Telegram and Discord webhooks in parallel.
+- **Dashboard** — `http://127.0.0.1:3000`, 5s refresh, SOL/USD-priced PnL.
+- **Metrics** — `http://127.0.0.1:9090/metrics`, Prometheus text format.
+- **CLI** — `pnpm cli { status | positions | trades | leaders | mute | unmute | mutes | export }`.
+- **Backtest** — `pnpm backtest trades.json` replays a JSON of leader swaps against current Jupiter quotes to shape-test the strategy.
+- **Tests** — Vitest, 25 cases across parser, scoring, HTTP retry, consensus, cooldown, and CSV export.
 
 ## First night — from zero to running
 
 ```bash
 pnpm install --ignore-workspace
-pnpm test                          # 16 unit tests, no network
-pnpm setup                         # interactive: writes .env, can generate a wallet
+pnpm test                          # 25 unit tests, no network
+pnpm setup                         # interactive wizard: writes .env, can generate a wallet
 
-# fund the wallet address the setup script prints with SOL you can afford to lose
+# fund the wallet address the wizard prints with SOL you can afford to lose
 
 pnpm dev                           # DRY_RUN=1 by default
-open http://127.0.0.1:3000
+open http://127.0.0.1:3000         # dashboard
+curl localhost:9090/metrics        # Prometheus scrape
 
 # in another terminal:
-pnpm cli status                    # PnL & open positions
-pnpm cli leaders                   # per-leader stats
-pnpm cli mute <addr> reason        # manually drop a leader
+pnpm cli status
+pnpm cli leaders
+pnpm cli export ./data/trades.csv
 
-# after ~24h of clean dry-run: edit .env → DRY_RUN=0, pnpm dev
+# after 24h of clean dry-run: edit .env → DRY_RUN=0, restart
 
 # panic button, any time:
 touch ~/.copy-trader-kill
 ```
 
-## Environment cheatsheet
+## Environment cheatsheet (highlights)
 
 | var | default | effect |
 |---|---|---|
 | `DRY_RUN` | `1` | Send no transactions |
-| `FIXED_BUY_SOL` | `0.02` | SOL per copied buy (overrides percent) |
-| `LEADER_PERCENT` | `0` | Or copy N% of leader's SOL notional |
+| `FIXED_BUY_SOL` | `0.02` | SOL per copied buy |
 | `MAX_CONCURRENT_POSITIONS` | `5` | Hard cap |
-| `MIN_LEADER_SOL_LAMPORTS` | `1e8` | Skip leader's dust buys (<0.1 SOL) |
-| `STOP_LOSS_PCT` | `0.30` | Exit if -30% from entry |
-| `TAKE_PROFIT_PCT` | `1.0` | Arm trailing stop at +100% |
-| `TRAILING_STOP_PCT` | `0.20` | Exit if -20% off peak once TP armed |
-| `PRICE_CHECK_INTERVAL_SEC` | `20` | Price-watch cadence |
+| `MIN_LEADER_SOL_LAMPORTS` | `1e8` | Skip leader's dust buys |
+| `STOP_LOSS_PCT` | `0.30` | |
+| `TAKE_PROFIT_PCT` / `TRAILING_STOP_PCT` | `1.0` / `0.20` | |
+| `MAX_POSITION_AGE_HOURS` | `0` | Auto-exit stale positions (0=off) |
+| `PRIORITY_FEE_MICROLAMPORTS` / `_MAX` | `100k` / `2M` | Auto-doubles on retry |
+| `EXECUTION_MAX_ATTEMPTS` | `3` | Swap retry ceiling |
+| `JITO_ENABLED` / `JITO_TIP_LAMPORTS` | `0` / `10000` | Bundle submission with tip |
+| `EXTRA_RPC_URLS` | `` | Comma-separated extra senders for race |
+| `MIN_TOKEN_AGE_MINUTES` | `5` | Skip fresh-mint traps |
+| `CONSENSUS_MIN_LEADERS` / `_WINDOW_SEC` | `1` / `90` | N-of-K within window |
+| `MINT_REENTRY_COOLDOWN_MINUTES` | `60` | Don't rebuy right after selling |
+| `LEADER_REBUY_COOLDOWN_MINUTES` | `5` | Don't ladder into leader's fills |
+| `RUG_CHECK_ENABLED` | `1` | Mint/freeze authority + top holder |
+| `AUTO_MUTE_*` | `on, 5, 0.35, 4` | Drop losing leaders |
 | `DAILY_LOSS_LIMIT_SOL` | `0.5` | Bot pauses itself |
-| `SLIPPAGE_BPS` | `150` | 1.5% |
-| `PRIORITY_FEE_MICROLAMPORTS` | `100000` | Higher = faster inclusion |
-| `RUG_CHECK_ENABLED` | `1` | Block mintable/freezable/concentrated tokens |
-| `AUTO_MUTE_ENABLED` | `1` | Drop leaders who lose money |
-| `AUTO_MUTE_MIN_TRADES` | `5` | Sample size before muting |
-| `AUTO_MUTE_WIN_RATE_FLOOR` | `0.35` | Auto-mute below this winrate |
-| `AUTO_MUTE_LOSS_STREAK` | `4` | Or after this many consecutive losers |
-| `BLACKLIST_MINTS` | `` | Comma-separated mints never to touch |
-| `KILL_SWITCH_PATH` | `~/.copy-trader-kill` | Touch this file to pause |
-| `AUTO_DISCOVER` | `0` | Pull top wallets from GMGN |
-| `AUTO_DISCOVER_COUNT` | `5` | Number of wallets to pull |
-| `AUTO_DISCOVER_REFRESH_MINUTES` | `240` | Refresh cadence |
-| `TELEGRAM_BOT_TOKEN` / `_CHAT_ID` | `` | Optional Telegram alerts |
-| `DASHBOARD_PORT` | `3000` | HTTP dashboard |
+| `KILL_SWITCH_PATH` | `~/.copy-trader-kill` | Touch to pause |
+| `AUTO_DISCOVER` | `0` | GMGN top wallets |
+| `TELEGRAM_*` / `DISCORD_WEBHOOK_URL` | `` | Alerts |
+| `ENABLE_DASHBOARD` / `DASHBOARD_PORT` | `1` / `3000` | HTML UI |
+| `ENABLE_METRICS` / `METRICS_PORT` | `1` / `9090` | Prometheus |
+
+## Backtest
+
+```bash
+# trades.json is an array of { ts, leader, mint, side, leaderSol, leaderTokenAmount, leaderPreTokenAmount? }
+pnpm backtest trades.json --size 0.02 --max-positions 5 --mint-cd 60 --leader-cd 5
+```
+
+Note: Jupiter serves current quotes only, so replay simulates strategy shape (what would have been sized / blocked / auto-muted), not actual historical PnL. For real PnL you need Birdeye/GeckoTerminal/Jupiter Pro archival prices.
 
 ## Realistic latency
 
-Leader confirms → your fill: **2–8s** typical. If a token 20xes in 30s the leader still beats you. This is not front-running; it's late mirror. Your exits are yours, though — they run on your price-watch loop, not the leader's timing.
+Leader confirms → your fill: **2–8s** typical without Jito, ~1–3s with Jito bundles + tip. Exits are yours (price-watch loop, not leader-timed).
 
-## Testing
+## Known limits / possible next rounds
 
-- `pnpm test` — Vitest suite: parser (buy/sell/partial/failed-tx/edge cases), scoring (auto-mute logic), http (retry & non-retry).
-- `pnpm smoke` — legacy parser assertions via tsx.
-- `pnpm typecheck` — full project.
-
-## Known limits / next up
-
-- **Jito bundles** — swap `sendRawTransaction` for a Jito bundle submit for sub-slot inclusion.
-- **Multi-RPC racing** — run two providers and take whichever confirms first.
-- **Backtest** — replay leader txs against Jupiter's price history. Big project.
-- **Fresh-token gate** — no `getSignaturesForAddress` age check yet; consider skipping tokens <5 minutes old.
-- **Cost basis** — currently proportional per partial sell; not full FIFO.
+- **Historical price feed** for real backtest PnL (Birdeye Pro / GeckoTerminal API).
+- **WS race** across providers (send/subscribe races currently one direction only).
+- **DB migrations** — schema is stable but not versioned yet.
+- **Cost basis** — proportional per partial sell; not FIFO.
+- **Signal quality scoring** — holder count and LP burn status could gate buys too.
+- **Prometheus histogram for latency** — currently only counters + gauges.
 
 ## Warnings
 
 - Base58 secret keys are as dangerous as your seed phrase. Fresh wallet, funded with what you can lose.
-- Copy-trading has adverse selection: by the time you enter, price has already moved against you. A 60% win-rate leader can map to a break-even bot after slippage and fees.
-- Start with `FIXED_BUY_SOL=0.01`. Don't scale up until you've seen 20+ real trades survive.
+- Copy-trading has adverse selection. A 60% win-rate leader can map to a break-even bot after slippage + fees.
+- Start with `FIXED_BUY_SOL=0.01`, `CONSENSUS_MIN_LEADERS=2` for extra caution. Don't scale up until 20+ real trades survive.

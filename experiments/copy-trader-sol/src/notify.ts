@@ -1,14 +1,20 @@
-import { request } from "undici";
+import { fetchJson } from "./http.js";
 import { config } from "./config.js";
+import { discordNotify } from "./discord.js";
 import { log } from "./log.js";
 
 let queue: Promise<void> = Promise.resolve();
 
+/**
+ * Fan out one message to every configured channel (Telegram + Discord).
+ * Serialized so a slow channel never blocks execution.
+ */
 export function notify(msg: string): void {
+  discordNotify(msg);
   if (!config.telegramBotToken || !config.telegramChatId) return;
   queue = queue.then(async () => {
     try {
-      await request(
+      await fetchJson<{}>(
         `https://api.telegram.org/bot${config.telegramBotToken}/sendMessage`,
         {
           method: "POST",
@@ -19,10 +25,12 @@ export function notify(msg: string): void {
             parse_mode: "Markdown",
             disable_web_page_preview: true,
           }),
+          retries: 1,
+          timeoutMs: 4000,
         },
       );
     } catch (err) {
-      log.warn({ err }, "telegram notify failed");
+      log.warn({ err: (err as Error).message }, "telegram notify failed");
     }
   });
 }

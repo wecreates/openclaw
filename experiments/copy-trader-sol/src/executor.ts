@@ -6,12 +6,16 @@ import {
 import { buildSwapTx, quote } from "./jupiter.js";
 import { SOL_MINT, config } from "./config.js";
 import { log } from "./log.js";
+import { sendJitoBundle } from "./jito.js";
+import { raceSend, raceSendersReady } from "./rpc.js";
+import { incr } from "./metrics.js";
 
 export type ExecResult = {
   signature: string | null;
   solLamports: number;
   tokenAmountRaw: bigint;
   pricePerToken: number;
+  route: "dry" | "rpc" | "jito";
 };
 
 export async function buy(
@@ -59,29 +63,61 @@ async function swap(
       { inputMint, outputMint, in: q.inAmount, out: q.outAmount, impact: q.priceImpactPct },
       "DRY_RUN quote",
     );
-    return { signature: null, solLamports, tokenAmountRaw, pricePerToken };
+    incr("dryrun_quotes_total");
+    return { signature: null, solLamports, tokenAmountRaw, pricePerToken, route: "dry" };
   }
 
-  const b64 = await buildSwapTx({
-    quote: q,
-    userPublicKey: kp.publicKey.toBase58(),
-    priorityFeeMicrolamports: config.priorityFeeMicrolamports,
-  });
+  let priorityFee = config.priorityFeeMicrolamports;
+  let lastErr: Error | null = null;
+  for (let attempt = 0; attempt < config.executionMaxAttempts; attempt++) {
+    try {
+      const b64 = await buildSwapTx({
+        quote: q,
+        userPublicKey: kp.publicKey.toBase58(),
+        priorityFeeMicrolamports: priorityFee,
+      });
+      const tx = VersionedTransaction.deserialize(Buffer.from(b64, "base64"));
+      tx.sign([kp]);
 
-  const tx = VersionedTransaction.deserialize(Buffer.from(b64, "base64"));
-  tx.sign([kp]);
+      if (config.jitoEnabled) {
+        const { bundleId } = await sendJitoBundle(conn, kp, tx);
+        incr("jito_bundles_total");
+        return {
+          signature: bundleId,
+          solLamports,
+          tokenAmountRaw,
+          pricePerToken,
+          route: "jito",
+        };
+      }
 
-  const sig = await conn.sendRawTransaction(tx.serialize(), {
-    skipPreflight: true,
-    maxRetries: 3,
-  });
-  log.info({ sig }, "swap sent");
+      const sig =
+        raceSendersReady() > 0
+          ? await raceSend(conn, tx)
+          : await conn.sendRawTransaction(tx.serialize(), {
+              skipPreflight: true,
+              maxRetries: 3,
+            });
 
-  const conf = await conn.confirmTransaction(
-    { signature: sig, ...(await conn.getLatestBlockhash()) },
-    "confirmed",
-  );
-  if (conf.value.err) throw new Error(`swap failed: ${JSON.stringify(conf.value.err)}`);
-
-  return { signature: sig, solLamports, tokenAmountRaw, pricePerToken };
+      const bh = await conn.getLatestBlockhash();
+      const conf = await conn.confirmTransaction(
+        { signature: sig, ...bh },
+        "confirmed",
+      );
+      if (conf.value.err) {
+        throw new Error(`confirm err: ${JSON.stringify(conf.value.err)}`);
+      }
+      incr("rpc_swaps_total");
+      return { signature: sig, solLamports, tokenAmountRaw, pricePerToken, route: "rpc" };
+    } catch (err) {
+      lastErr = err as Error;
+      log.warn(
+        { err: lastErr.message, attempt, priorityFee },
+        "swap attempt failed",
+      );
+      incr("swap_retries_total");
+      priorityFee = Math.min(priorityFee * 2, config.priorityFeeMicrolamportsMax);
+    }
+  }
+  throw lastErr ?? new Error("swap failed after retries");
 }

@@ -1,15 +1,16 @@
 {
   "name": "copy-trader-sol",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "private": true,
   "type": "module",
-  "description": "Copy-trade Solana wallets you follow. Jupiter-routed swaps, stop-loss + trailing take-profit, rug check, auto-mute losing leaders, kill switch, live dashboard, CLI.",
+  "description": "Copy-trade Solana wallets. Jupiter routing + optional Jito bundles + multi-RPC racing. Stop-loss, trailing take-profit, position-age exit, consensus, cooldowns, rug check, auto-mute, kill switch, live dashboard, Prometheus metrics, CSV export.",
   "scripts": {
     "setup": "tsx src/setup.ts",
     "build": "tsc",
     "start": "node --enable-source-maps dist/index.js",
     "dev": "tsx src/index.ts",
     "cli": "tsx src/cli.ts",
+    "backtest": "tsx src/backtest.ts",
     "smoke": "tsx src/smoke.ts",
     "test": "vitest run",
     "test:watch": "vitest",

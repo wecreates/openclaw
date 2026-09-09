@@ -28,11 +28,7 @@ const followed = (process.env.FOLLOWED_WALLETS ?? "")
   .map((s) => s.trim())
   .filter(Boolean);
 for (const w of followed) {
-  try {
-    new PublicKey(w);
-  } catch {
-    throw new Error(`Invalid followed wallet: ${w}`);
-  }
+  try { new PublicKey(w); } catch { throw new Error(`Invalid followed wallet: ${w}`); }
 }
 
 export const config = {
@@ -52,14 +48,27 @@ export const config = {
   dailyLossLimitSol: num("DAILY_LOSS_LIMIT_SOL", 0.5),
   slippageBps: num("SLIPPAGE_BPS", 150),
   minLiquidityUsd: num("MIN_LIQUIDITY_USD", 25000),
+
   priorityFeeMicrolamports: num("PRIORITY_FEE_MICROLAMPORTS", 100000),
+  priorityFeeMicrolamportsMax: num("PRIORITY_FEE_MICROLAMPORTS_MAX", 2_000_000),
+  executionMaxAttempts: num("EXECUTION_MAX_ATTEMPTS", 3),
 
   stopLossPct: num("STOP_LOSS_PCT", 0.3),
   takeProfitPct: num("TAKE_PROFIT_PCT", 1.0),
   trailingStopPct: num("TRAILING_STOP_PCT", 0.2),
   priceCheckIntervalSec: num("PRICE_CHECK_INTERVAL_SEC", 20),
+  maxPositionAgeHours: num("MAX_POSITION_AGE_HOURS", 0),
 
   minLeaderSolLamports: num("MIN_LEADER_SOL_LAMPORTS", 100_000_000),
+
+  minTokenAgeMinutes: num("MIN_TOKEN_AGE_MINUTES", 5),
+  strictTokenAge: bool("STRICT_TOKEN_AGE", false),
+
+  consensusMinLeaders: num("CONSENSUS_MIN_LEADERS", 1),
+  consensusWindowSec: num("CONSENSUS_WINDOW_SEC", 90),
+
+  mintReentryCooldownMinutes: num("MINT_REENTRY_COOLDOWN_MINUTES", 60),
+  leaderRebuyCooldownMinutes: num("LEADER_REBUY_COOLDOWN_MINUTES", 5),
 
   rugCheckEnabled: bool("RUG_CHECK_ENABLED", true),
 
@@ -68,14 +77,22 @@ export const config = {
   autoMuteWinRateFloor: num("AUTO_MUTE_WIN_RATE_FLOOR", 0.35),
   autoMuteLossStreak: num("AUTO_MUTE_LOSS_STREAK", 4),
 
+  jitoEnabled: bool("JITO_ENABLED", false),
+  jitoBlockEngineUrl: opt("JITO_BLOCK_ENGINE_URL") ??
+    "https://mainnet.block-engine.jito.wtf/api/v1/bundles",
+  jitoTipLamports: num("JITO_TIP_LAMPORTS", 10_000),
+
   killSwitchPath:
     opt("KILL_SWITCH_PATH") ?? `${process.env.HOME ?? ""}/.copy-trader-kill`,
 
   telegramBotToken: opt("TELEGRAM_BOT_TOKEN"),
   telegramChatId: opt("TELEGRAM_CHAT_ID"),
+  discordWebhookUrl: opt("DISCORD_WEBHOOK_URL"),
 
   dashboardPort: num("DASHBOARD_PORT", 3000),
   enableDashboard: bool("ENABLE_DASHBOARD", true),
+  metricsPort: num("METRICS_PORT", 9090),
+  enableMetrics: bool("ENABLE_METRICS", true),
 
   dryRun: bool("DRY_RUN", true),
   logLevel: process.env.LOG_LEVEL ?? "info",

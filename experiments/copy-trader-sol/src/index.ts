@@ -26,6 +26,16 @@ import { fmtSol, notify } from "./notify.js";
 import { reconcilePositions } from "./reconcile.js";
 import { isBlockingRug, rugCheck } from "./rugcheck.js";
 import { evaluateAutoMute, isMuted } from "./scoring.js";
+import { passesTokenAge } from "./tokenage.js";
+import { registerBuyIntent } from "./consensus.js";
+import {
+  leaderOnCooldown,
+  markLeaderBought,
+  markMintSold,
+  mintOnCooldown,
+} from "./cooldown.js";
+import { startMetrics, incr } from "./metrics.js";
+import { raceSendersReady } from "./rpc.js";
 
 async function main() {
   const kp = loadKeypair();
@@ -35,7 +45,12 @@ async function main() {
   });
 
   log.info(
-    { wallet: kp.publicKey.toBase58(), dryRun: config.dryRun },
+    {
+      wallet: kp.publicKey.toBase58(),
+      dryRun: config.dryRun,
+      jito: config.jitoEnabled,
+      extraSenders: raceSendersReady(),
+    },
     "starting copy-trader",
   );
 
@@ -57,27 +72,40 @@ async function main() {
   log.info({ count: wallets.length }, "resolved followed wallets");
 
   const stopWatcher = watchWallets(conn, wallets, async (swap) => {
+    incr("leader_swaps_seen_total");
     if (isMuted(swap.leader)) {
-      log.info({ leader: swap.leader }, "skipping: leader muted");
-      return;
+      incr("skipped_muted_total"); return;
     }
     const gate = preTradeGate(swap.side);
     if (gate) {
       log.warn({ reason: gate, mint: swap.tokenMint }, "skipping");
+      incr("skipped_gate_total");
       return;
     }
     if (isBlacklisted(swap.tokenMint)) {
-      log.info({ mint: swap.tokenMint }, "skipping: blacklisted");
-      return;
+      incr("skipped_blacklist_total"); return;
     }
 
     try {
       if (swap.side === "buy") {
         if (leaderTradeTooSmall(swap.solLamports)) {
+          incr("skipped_leader_dust_total"); return;
+        }
+        if (mintOnCooldown(swap.tokenMint)) {
+          log.info({ mint: swap.tokenMint }, "skipping: mint on cooldown after prior sell");
+          incr("skipped_mint_cooldown_total"); return;
+        }
+        if (leaderOnCooldown(swap.leader)) {
+          incr("skipped_leader_cooldown_total"); return;
+        }
+
+        const age = await passesTokenAge(conn, swap.tokenMint);
+        if (!age.ok) {
           log.info(
-            { mint: swap.tokenMint, sol: swap.solLamports / LAMPORTS_PER_SOL },
-            "skipping: leader trade below min notional",
+            { mint: swap.tokenMint, ageMinutes: age.ageMinutes },
+            "skipping: token too young",
           );
+          incr("skipped_token_age_total");
           return;
         }
 
@@ -88,18 +116,28 @@ async function main() {
             notify(
               `⚠️ skipped *${swap.tokenMint.slice(0, 6)}…*\nrug: ${rug.reasons.join("; ")}`,
             );
+            incr("skipped_rug_total");
             return;
           }
         }
 
         if (!(await passesLiquidity(swap.tokenMint))) {
-          log.info({ mint: swap.tokenMint }, "skipping: illiquid");
+          incr("skipped_liquidity_total"); return;
+        }
+
+        const consensus = registerBuyIntent(swap.tokenMint, swap.leader);
+        if (!consensus.cleared) {
+          log.info(
+            { mint: swap.tokenMint, need: config.consensusMinLeaders, have: consensus.leaders.length },
+            "buy queued: waiting for consensus",
+          );
+          incr("consensus_waiting_total");
           return;
         }
+
         const size = sizeBuyLamports(swap.solLamports);
         if (size <= 0) {
-          log.warn("skipping: no sizing configured");
-          return;
+          log.warn("skipping: no sizing configured"); return;
         }
         const res = await buy(conn, kp, swap.tokenMint, size);
         openPosition({
@@ -119,20 +157,16 @@ async function main() {
           leader: swap.leader,
           solDeltaLamports: -res.solLamports,
           txSig: res.signature,
-          reason: `copy ${swap.leader.slice(0, 6)}`,
+          reason: `copy ${swap.leader.slice(0, 6)} · ${res.route}`,
         });
+        markLeaderBought(swap.leader);
+        incr("buys_total");
         notify(
-          `🟢 buy *${swap.tokenMint.slice(0, 6)}…* via ${swap.leader.slice(0, 6)}\nspent ${fmtSol(res.solLamports)} SOL`,
+          `🟢 buy *${swap.tokenMint.slice(0, 6)}…* via ${swap.leader.slice(0, 6)}\nspent ${fmtSol(res.solLamports)} SOL · ${res.route}`,
         );
       } else {
         const pos = getPosition(swap.tokenMint, swap.leader);
-        if (!pos) {
-          log.info(
-            { mint: swap.tokenMint, leader: swap.leader },
-            "leader sold token we don't hold from them — skipping",
-          );
-          return;
-        }
+        if (!pos) return;
         const held = BigInt(pos.amountRaw);
         const soldByLeader = swap.tokenAmountRaw;
         const leaderPre = swap.leaderPreTokenAmount;
@@ -140,13 +174,9 @@ async function main() {
           leaderPre > 0n
             ? Number((soldByLeader * 10000n) / leaderPre) / 10000
             : 1;
-        const sellAmount = fraction >= 0.95
-          ? held
-          : BigInt(Math.floor(Number(held) * fraction));
-        if (sellAmount <= 0n) {
-          log.info("computed sell amount 0 — skipping");
-          return;
-        }
+        const sellAmount =
+          fraction >= 0.95 ? held : BigInt(Math.floor(Number(held) * fraction));
+        if (sellAmount <= 0n) return;
         const isFullExit = sellAmount === held;
         const res = await sell(conn, kp, swap.tokenMint, sellAmount);
         const proportionalCost = Math.floor(
@@ -154,6 +184,7 @@ async function main() {
         );
         if (isFullExit) {
           closePosition(swap.tokenMint, swap.leader);
+          markMintSold(swap.tokenMint);
         } else {
           const remaining = held - sellAmount;
           const remainingCost = pos.solSpentLamports - proportionalCost;
@@ -171,10 +202,11 @@ async function main() {
           leader: swap.leader,
           solDeltaLamports: realized,
           txSig: res.signature,
-          reason: `follow ${swap.leader.slice(0, 6)} sell${isFullExit ? "" : ` ${(fraction * 100).toFixed(0)}%`}`,
+          reason: `follow ${swap.leader.slice(0, 6)} sell${isFullExit ? "" : ` ${(fraction * 100).toFixed(0)}%`} · ${res.route}`,
         });
+        incr("sells_total");
         notify(
-          `🔴 sell *${swap.tokenMint.slice(0, 6)}…* (${isFullExit ? "full" : `${(fraction * 100).toFixed(0)}%`}) via ${swap.leader.slice(0, 6)}\nrealized ${fmtSol(realized)} SOL`,
+          `🔴 sell *${swap.tokenMint.slice(0, 6)}…* (${isFullExit ? "full" : `${(fraction * 100).toFixed(0)}%`}) via ${swap.leader.slice(0, 6)}\nrealized ${fmtSol(realized)} SOL · ${res.route}`,
         );
         if (config.autoMuteEnabled) {
           const mute = evaluateAutoMute(swap.leader, {
@@ -185,19 +217,20 @@ async function main() {
           if (mute.muted) {
             log.warn({ leader: swap.leader, reason: mute.reason }, "auto-muted leader");
             notify(`🔇 muted ${swap.leader.slice(0, 6)}: ${mute.reason}`);
+            incr("auto_mutes_total");
           }
         }
       }
     } catch (err) {
       log.error({ err, swap }, "execution failed");
+      incr("execution_errors_total");
       notify(`⚠️ execution failed for ${swap.tokenMint.slice(0, 6)}…: ${(err as Error).message}`);
     }
   });
 
   const stopPrice = startPriceWatcher(conn, kp);
-  const stopDash = config.enableDashboard
-    ? startDashboard(kp.publicKey)
-    : () => {};
+  const stopDash = config.enableDashboard ? startDashboard(kp.publicKey) : () => {};
+  const stopMetrics = startMetrics();
 
   if (config.autoDiscover && config.autoDiscoverRefreshMinutes > 0) {
     setInterval(async () => {
@@ -214,12 +247,15 @@ async function main() {
     await stopWatcher();
     stopPrice();
     stopDash();
+    stopMetrics();
     process.exit(0);
   };
   process.on("SIGINT", () => void shutdown("SIGINT"));
   process.on("SIGTERM", () => void shutdown("SIGTERM"));
 
-  notify(`🚀 copy-trader started · dryRun=${config.dryRun} · following ${wallets.length}`);
+  notify(
+    `🚀 copy-trader started · dryRun=${config.dryRun} · following ${wallets.length}${config.jitoEnabled ? " · jito" : ""}${raceSendersReady() > 0 ? ` · ${raceSendersReady() + 1} senders` : ""}`,
+  );
 }
 
 main().catch((err) => {
