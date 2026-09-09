@@ -8,16 +8,19 @@ export type Swap = {
   solLamports: number;
   tokenAmountRaw: bigint;
   tokenDecimals: number;
+  leaderPreTokenAmount: bigint;
+  leaderPostTokenAmount: bigint;
   signature: string;
   slot: number;
 };
 
 /**
  * Detect a swap by diffing the leader's pre/post balances in a tx.
- * DEX-agnostic — works for Jupiter, Raydium, Pump.fun, Meteora, Orca, anything.
+ * DEX-agnostic — works for Jupiter, Raydium, Pump.fun, Meteora, Orca.
  *
  * Buy  = leader spent SOL and received an SPL token.
  * Sell = leader received SOL and sent an SPL token.
+ * Also carries leader's pre/post token balance so callers can size partial sells.
  */
 export function detectSwapForWallet(
   tx: ParsedTransactionWithMeta,
@@ -39,36 +42,46 @@ export function detectSwapForWallet(
 
   const pre = meta.preTokenBalances ?? [];
   const post = meta.postTokenBalances ?? [];
-  const byMint = new Map<string, { delta: bigint; decimals: number }>();
+  type Snapshot = { amount: bigint; decimals: number };
+  const preByMint = new Map<string, Snapshot>();
+  const postByMint = new Map<string, Snapshot>();
 
-  const collect = (
+  const fill = (
     entries: typeof pre,
-    sign: 1 | -1,
+    dest: Map<string, Snapshot>,
   ): void => {
     for (const b of entries) {
       if (b.owner !== leader) continue;
-      const mint = b.mint;
-      if (mint === SOL_MINT) continue;
-      const raw = BigInt(b.uiTokenAmount.amount);
-      const prev = byMint.get(mint) ?? {
-        delta: 0n,
-        decimals: b.uiTokenAmount.decimals,
-      };
-      prev.delta += sign === 1 ? raw : -raw;
-      prev.decimals = b.uiTokenAmount.decimals;
-      byMint.set(mint, prev);
+      if (b.mint === SOL_MINT) continue;
+      const amount = BigInt(b.uiTokenAmount.amount);
+      const prev = dest.get(b.mint);
+      if (prev) prev.amount += amount;
+      else dest.set(b.mint, { amount, decimals: b.uiTokenAmount.decimals });
     }
   };
-  collect(post, 1);
-  collect(pre, -1);
+  fill(pre, preByMint);
+  fill(post, postByMint);
 
-  let candidate: { mint: string; delta: bigint; decimals: number } | null =
-    null;
-  for (const [mint, v] of byMint) {
-    if (v.delta === 0n) continue;
-    if (!candidate || (v.delta < 0n ? -v.delta : v.delta) >
-        (candidate.delta < 0n ? -candidate.delta : candidate.delta)) {
-      candidate = { mint, ...v };
+  const mints = new Set([...preByMint.keys(), ...postByMint.keys()]);
+  let candidate: {
+    mint: string;
+    delta: bigint;
+    decimals: number;
+    preAmount: bigint;
+    postAmount: bigint;
+  } | null = null;
+  for (const mint of mints) {
+    const preSnap = preByMint.get(mint);
+    const postSnap = postByMint.get(mint);
+    const preAmount = preSnap?.amount ?? 0n;
+    const postAmount = postSnap?.amount ?? 0n;
+    const delta = postAmount - preAmount;
+    if (delta === 0n) continue;
+    const decimals = (postSnap ?? preSnap)!.decimals;
+    const absDelta = delta < 0n ? -delta : delta;
+    const absCandidate = candidate ? (candidate.delta < 0n ? -candidate.delta : candidate.delta) : 0n;
+    if (!candidate || absDelta > absCandidate) {
+      candidate = { mint, delta, decimals, preAmount, postAmount };
     }
   }
   if (!candidate) return null;
@@ -82,9 +95,10 @@ export function detectSwapForWallet(
     side: boughtToken ? "buy" : "sell",
     tokenMint: candidate.mint,
     solLamports: Math.abs(solDelta),
-    tokenAmountRaw:
-      candidate.delta < 0n ? -candidate.delta : candidate.delta,
+    tokenAmountRaw: candidate.delta < 0n ? -candidate.delta : candidate.delta,
     tokenDecimals: candidate.decimals,
+    leaderPreTokenAmount: candidate.preAmount,
+    leaderPostTokenAmount: candidate.postAmount,
     signature: tx.transaction.signatures[0] ?? "",
     slot: tx.slot,
   };

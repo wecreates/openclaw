@@ -67,6 +67,10 @@ function fakeTx(args: {
   } as any;
 }
 
+function assert(cond: unknown, msg: string): void {
+  if (!cond) throw new Error(`assert failed: ${msg}`);
+}
+
 async function main() {
   log.info("[1] BUY: leader spends 1 SOL, receives 1000 TOKEN");
   const buy = detectSwapForWallet(
@@ -79,16 +83,35 @@ async function main() {
     }),
     LEADER,
   );
-  log.info({ buy }, "detected");
   assert(buy?.side === "buy", "expected buy");
   assert(buy?.tokenMint === TOKEN, "wrong mint");
   assert(buy?.solLamports === LAMPORTS_PER_SOL, "wrong SOL notional");
+  assert(buy?.leaderPreTokenAmount === 0n, "leader had 0 pre");
+  assert(buy?.leaderPostTokenAmount === 1_000_000_000n, "wrong post");
+  log.info({ buy }, "ok");
 
-  log.info("[2] SELL: leader sends 500 TOKEN, receives 0.6 SOL");
-  const sell = detectSwapForWallet(
+  log.info("[2] FULL SELL: leader sells 1000 → 0 TOKEN, receives 1.2 SOL");
+  const fullSell = detectSwapForWallet(
     fakeTx({
-      sig: "sigSELL",
+      sig: "sigFULL",
       slot: 2,
+      preSol: 1 * LAMPORTS_PER_SOL,
+      postSol: 1 * LAMPORTS_PER_SOL + 1.2 * LAMPORTS_PER_SOL - 5000,
+      preTokenAmount: "1000000000",
+    }),
+    LEADER,
+  );
+  assert(fullSell?.side === "sell", "expected sell");
+  assert(fullSell?.leaderPreTokenAmount === 1_000_000_000n, "wrong pre");
+  assert(fullSell?.leaderPostTokenAmount === 0n, "wrong post");
+  assert(fullSell?.tokenAmountRaw === 1_000_000_000n, "wrong sell amount");
+  log.info({ fullSell }, "ok");
+
+  log.info("[3] PARTIAL SELL: leader sells 500 of 1000, receives 0.6 SOL — fraction=50%");
+  const partial = detectSwapForWallet(
+    fakeTx({
+      sig: "sigPART",
+      slot: 3,
       preSol: 1 * LAMPORTS_PER_SOL,
       postSol: 1 * LAMPORTS_PER_SOL + 0.6 * LAMPORTS_PER_SOL - 5000,
       preTokenAmount: "1000000000",
@@ -96,42 +119,40 @@ async function main() {
     }),
     LEADER,
   );
-  log.info({ sell }, "detected");
-  assert(sell?.side === "sell", "expected sell");
-  assert(sell?.tokenAmountRaw === 500000000n, "wrong token amount sold");
+  assert(partial?.side === "sell", "expected sell");
+  const fraction =
+    Number((partial!.tokenAmountRaw * 10000n) / partial!.leaderPreTokenAmount) / 10000;
+  assert(Math.abs(fraction - 0.5) < 1e-9, `expected 0.5 got ${fraction}`);
+  log.info({ partial, fraction }, "ok");
 
-  log.info("[3] unrelated tx (different wallet): expect null");
+  log.info("[4] unrelated wallet: expect null");
   const none = detectSwapForWallet(
     fakeTx({
       sig: "sigNULL",
-      slot: 3,
+      slot: 4,
       preSol: 1000,
       postSol: 995,
       ownerKey: "OtherWalletxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
     }),
     LEADER,
   );
-  log.info({ none }, "detected");
-  assert(none === null, "expected null for unrelated tx");
+  assert(none === null, "expected null");
+  log.info("ok");
 
-  log.info("[4] failed tx (meta.err set): expect null");
+  log.info("[5] failed tx: expect null");
   const errTx = fakeTx({
     sig: "sigERR",
-    slot: 4,
+    slot: 5,
     preSol: 2 * LAMPORTS_PER_SOL,
     postSol: 1 * LAMPORTS_PER_SOL,
     postTokenAmount: "1000000000",
   });
   errTx.meta.err = { InstructionError: [0, "Custom"] };
   const errRes = detectSwapForWallet(errTx, LEADER);
-  log.info({ errRes }, "detected");
-  assert(errRes === null, "expected null for failed tx");
+  assert(errRes === null, "expected null");
+  log.info("ok");
 
   log.info("ALL PARSER TESTS PASSED");
-}
-
-function assert(cond: unknown, msg: string): void {
-  if (!cond) throw new Error(`assert failed: ${msg}`);
 }
 
 main().catch((e) => {

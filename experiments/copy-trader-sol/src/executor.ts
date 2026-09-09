@@ -11,6 +11,7 @@ export type ExecResult = {
   signature: string | null;
   solLamports: number;
   tokenAmountRaw: bigint;
+  pricePerToken: number;
 };
 
 export async function buy(
@@ -45,16 +46,20 @@ async function swap(
     slippageBps: config.slippageBps,
   });
 
+  const solLamports =
+    inputMint === SOL_MINT ? Number(q.inAmount) : Number(q.outAmount);
+  const tokenAmountRaw = BigInt(
+    inputMint === SOL_MINT ? q.outAmount : q.inAmount,
+  );
+  const pricePerToken =
+    tokenAmountRaw > 0n ? solLamports / Number(tokenAmountRaw) : 0;
+
   if (config.dryRun) {
     log.info(
       { inputMint, outputMint, in: q.inAmount, out: q.outAmount, impact: q.priceImpactPct },
       "DRY_RUN quote",
     );
-    return {
-      signature: null,
-      solLamports: inputMint === SOL_MINT ? Number(q.inAmount) : Number(q.outAmount),
-      tokenAmountRaw: BigInt(inputMint === SOL_MINT ? q.outAmount : q.inAmount),
-    };
+    return { signature: null, solLamports, tokenAmountRaw, pricePerToken };
   }
 
   const b64 = await buildSwapTx({
@@ -78,9 +83,5 @@ async function swap(
   );
   if (conf.value.err) throw new Error(`swap failed: ${JSON.stringify(conf.value.err)}`);
 
-  return {
-    signature: sig,
-    solLamports: inputMint === SOL_MINT ? Number(q.inAmount) : Number(q.outAmount),
-    tokenAmountRaw: BigInt(inputMint === SOL_MINT ? q.outAmount : q.inAmount),
-  };
+  return { signature: sig, solLamports, tokenAmountRaw, pricePerToken };
 }

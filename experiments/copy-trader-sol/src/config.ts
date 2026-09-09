@@ -6,7 +6,10 @@ function req(name: string): string {
   if (!v) throw new Error(`Missing env: ${name}`);
   return v;
 }
-
+function opt(name: string): string | undefined {
+  const v = process.env[name];
+  return v && v.length > 0 ? v : undefined;
+}
 function num(name: string, fallback: number): number {
   const v = process.env[name];
   if (v === undefined || v === "") return fallback;
@@ -14,7 +17,6 @@ function num(name: string, fallback: number): number {
   if (!Number.isFinite(n)) throw new Error(`Env ${name} is not a number: ${v}`);
   return n;
 }
-
 function bool(name: string, fallback: boolean): boolean {
   const v = process.env[name];
   if (v === undefined || v === "") return fallback;
@@ -25,7 +27,6 @@ const followed = (process.env.FOLLOWED_WALLETS ?? "")
   .split(",")
   .map((s) => s.trim())
   .filter(Boolean);
-
 for (const w of followed) {
   try {
     new PublicKey(w);
@@ -38,15 +39,40 @@ export const config = {
   rpcUrl: req("RPC_URL"),
   wsUrl: req("WS_URL"),
   walletSecret: req("WALLET_SECRET_KEY"),
+
   followedWallets: followed,
+  autoDiscover: bool("AUTO_DISCOVER", false),
+  autoDiscoverCount: num("AUTO_DISCOVER_COUNT", 5),
+  autoDiscoverRefreshMinutes: num("AUTO_DISCOVER_REFRESH_MINUTES", 240),
+
   fixedBuySol: num("FIXED_BUY_SOL", 0),
   leaderPercent: num("LEADER_PERCENT", 0),
+  maxConcurrentPositions: num("MAX_CONCURRENT_POSITIONS", 5),
+
   dailyLossLimitSol: num("DAILY_LOSS_LIMIT_SOL", 0.5),
   slippageBps: num("SLIPPAGE_BPS", 150),
   minLiquidityUsd: num("MIN_LIQUIDITY_USD", 25000),
   priorityFeeMicrolamports: num("PRIORITY_FEE_MICROLAMPORTS", 100000),
+
+  stopLossPct: num("STOP_LOSS_PCT", 0.3),
+  takeProfitPct: num("TAKE_PROFIT_PCT", 1.0),
+  trailingStopPct: num("TRAILING_STOP_PCT", 0.2),
+  priceCheckIntervalSec: num("PRICE_CHECK_INTERVAL_SEC", 20),
+
+  minLeaderSolLamports: num("MIN_LEADER_SOL_LAMPORTS", 100_000_000),
+
+  killSwitchPath:
+    opt("KILL_SWITCH_PATH") ?? `${process.env.HOME ?? ""}/.copy-trader-kill`,
+
+  telegramBotToken: opt("TELEGRAM_BOT_TOKEN"),
+  telegramChatId: opt("TELEGRAM_CHAT_ID"),
+
+  dashboardPort: num("DASHBOARD_PORT", 3000),
+  enableDashboard: bool("ENABLE_DASHBOARD", true),
+
   dryRun: bool("DRY_RUN", true),
   logLevel: process.env.LOG_LEVEL ?? "info",
 } as const;
 
 export const SOL_MINT = "So11111111111111111111111111111111111111112";
+export const USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";

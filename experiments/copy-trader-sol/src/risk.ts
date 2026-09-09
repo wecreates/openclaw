@@ -1,7 +1,8 @@
+import { existsSync } from "node:fs";
 import { LAMPORTS_PER_SOL } from "@solana/web3.js";
 import { request } from "undici";
 import { SOL_MINT, config } from "./config.js";
-import { pnlLast24hLamports } from "./state.js";
+import { countPositions, pnlLast24hLamports } from "./state.js";
 import { log } from "./log.js";
 
 const BLACKLIST = new Set<string>(
@@ -13,6 +14,18 @@ const BLACKLIST = new Set<string>(
 
 export function isBlacklisted(mint: string): boolean {
   return BLACKLIST.has(mint) || mint === SOL_MINT;
+}
+
+export function killSwitchTripped(): boolean {
+  return existsSync(config.killSwitchPath);
+}
+
+export function tooManyPositions(): boolean {
+  return countPositions() >= config.maxConcurrentPositions;
+}
+
+export function leaderTradeTooSmall(leaderSolLamports: number): boolean {
+  return leaderSolLamports < config.minLeaderSolLamports;
 }
 
 export function sizeBuyLamports(leaderSolLamports: number): number {
@@ -35,7 +48,6 @@ export function dailyLossExceeded(): boolean {
   return false;
 }
 
-/** Rough liquidity check via Jupiter's price API — skips if quote unavailable or impact too high. */
 export async function passesLiquidity(mint: string): Promise<boolean> {
   try {
     const probe = Math.floor(0.1 * LAMPORTS_PER_SOL);
@@ -51,4 +63,11 @@ export async function passesLiquidity(mint: string): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+export function preTradeGate(kind: "buy" | "sell"): string | null {
+  if (killSwitchTripped()) return `kill switch active at ${config.killSwitchPath}`;
+  if (dailyLossExceeded()) return "daily loss limit reached";
+  if (kind === "buy" && tooManyPositions()) return "max concurrent positions reached";
+  return null;
 }
