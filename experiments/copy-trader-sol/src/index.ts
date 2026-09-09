@@ -36,6 +36,11 @@ import {
 } from "./cooldown.js";
 import { startMetrics, incr } from "./metrics.js";
 import { raceSendersReady } from "./rpc.js";
+import { recoverPending } from "./pendingswap.js";
+import { unwrapStrayWsol } from "./wsol.js";
+import { startSellQueue } from "./sellqueue.js";
+import { startBalanceMonitor } from "./balancemon.js";
+import { markLeaderSwap } from "./health.js";
 
 async function main() {
   const kp = loadKeypair();
@@ -50,6 +55,7 @@ async function main() {
       dryRun: config.dryRun,
       jito: config.jitoEnabled,
       extraSenders: raceSendersReady(),
+      logFile: config.logFile ?? null,
     },
     "starting copy-trader",
   );
@@ -57,73 +63,63 @@ async function main() {
   const pf = await runPreflight(conn, kp.publicKey);
   for (const w of pf.warnings) log.warn(w);
   for (const e of pf.errors) log.error(e);
-  if (!pf.ok) {
-    log.fatal("preflight failed — fix errors above and retry");
-    process.exit(1);
+  if (!pf.ok) { log.fatal("preflight failed — fix errors above and retry"); process.exit(1); }
+
+  const pending = await recoverPending(conn);
+  if (pending.landed || pending.failed || pending.expired || pending.stillPending) {
+    log.info(pending, "pending swap recovery finished");
+  }
+
+  if (!config.dryRun && config.wsolCleanupOnStart) {
+    try {
+      const r = await unwrapStrayWsol(conn, kp);
+      if (r.unwrapped > 0) {
+        log.info({ lamports: r.unwrapped, sig: r.sig }, "unwrapped stray wSOL");
+      }
+    } catch (err) {
+      log.warn({ err: (err as Error).message }, "wsol cleanup failed (non-fatal)");
+    }
   }
 
   await reconcilePositions(conn, kp.publicKey);
 
   let wallets = await resolveWallets();
-  if (wallets.length === 0) {
-    log.fatal("no wallets to follow after discovery");
-    process.exit(1);
-  }
+  if (wallets.length === 0) { log.fatal("no wallets to follow"); process.exit(1); }
   log.info({ count: wallets.length }, "resolved followed wallets");
 
   const stopWatcher = watchWallets(conn, wallets, async (swap) => {
+    markLeaderSwap();
     incr("leader_swaps_seen_total");
-    if (isMuted(swap.leader)) {
-      incr("skipped_muted_total"); return;
-    }
+    if (isMuted(swap.leader)) { incr("skipped_muted_total"); return; }
     const gate = preTradeGate(swap.side);
     if (gate) {
       log.warn({ reason: gate, mint: swap.tokenMint }, "skipping");
-      incr("skipped_gate_total");
-      return;
+      incr("skipped_gate_total"); return;
     }
-    if (isBlacklisted(swap.tokenMint)) {
-      incr("skipped_blacklist_total"); return;
-    }
+    if (isBlacklisted(swap.tokenMint)) { incr("skipped_blacklist_total"); return; }
 
     try {
       if (swap.side === "buy") {
-        if (leaderTradeTooSmall(swap.solLamports)) {
-          incr("skipped_leader_dust_total"); return;
-        }
-        if (mintOnCooldown(swap.tokenMint)) {
-          log.info({ mint: swap.tokenMint }, "skipping: mint on cooldown after prior sell");
-          incr("skipped_mint_cooldown_total"); return;
-        }
-        if (leaderOnCooldown(swap.leader)) {
-          incr("skipped_leader_cooldown_total"); return;
-        }
+        if (leaderTradeTooSmall(swap.solLamports)) { incr("skipped_leader_dust_total"); return; }
+        if (mintOnCooldown(swap.tokenMint)) { incr("skipped_mint_cooldown_total"); return; }
+        if (leaderOnCooldown(swap.leader)) { incr("skipped_leader_cooldown_total"); return; }
 
         const age = await passesTokenAge(conn, swap.tokenMint);
         if (!age.ok) {
-          log.info(
-            { mint: swap.tokenMint, ageMinutes: age.ageMinutes },
-            "skipping: token too young",
-          );
-          incr("skipped_token_age_total");
-          return;
+          log.info({ mint: swap.tokenMint, ageMinutes: age.ageMinutes }, "skipping: token too young");
+          incr("skipped_token_age_total"); return;
         }
 
         if (config.rugCheckEnabled) {
           const rug = await rugCheck(conn, swap.tokenMint);
           if (isBlockingRug(rug)) {
             log.warn({ mint: swap.tokenMint, reasons: rug.reasons }, "skipping: rug check failed");
-            notify(
-              `⚠️ skipped *${swap.tokenMint.slice(0, 6)}…*\nrug: ${rug.reasons.join("; ")}`,
-            );
-            incr("skipped_rug_total");
-            return;
+            notify(`⚠️ skipped *${swap.tokenMint.slice(0, 6)}…*\nrug: ${rug.reasons.join("; ")}`);
+            incr("skipped_rug_total"); return;
           }
         }
 
-        if (!(await passesLiquidity(swap.tokenMint))) {
-          incr("skipped_liquidity_total"); return;
-        }
+        if (!(await passesLiquidity(swap.tokenMint))) { incr("skipped_liquidity_total"); return; }
 
         const consensus = registerBuyIntent(swap.tokenMint, swap.leader);
         if (!consensus.cleared) {
@@ -131,83 +127,60 @@ async function main() {
             { mint: swap.tokenMint, need: config.consensusMinLeaders, have: consensus.leaders.length },
             "buy queued: waiting for consensus",
           );
-          incr("consensus_waiting_total");
-          return;
+          incr("consensus_waiting_total"); return;
         }
 
         const size = sizeBuyLamports(swap.solLamports);
-        if (size <= 0) {
-          log.warn("skipping: no sizing configured"); return;
-        }
+        if (size <= 0) { log.warn("skipping: no sizing configured"); return; }
         const res = await buy(conn, kp, swap.tokenMint, size);
         openPosition({
-          mint: swap.tokenMint,
-          leader: swap.leader,
+          mint: swap.tokenMint, leader: swap.leader,
           amountRaw: res.tokenAmountRaw.toString(),
           solSpentLamports: res.solLamports,
-          openedAt: Date.now(),
-          txSig: res.signature,
-          entryPriceSolPerToken: res.pricePerToken,
-          peakPriceSolPerToken: res.pricePerToken,
-          lastPriceSolPerToken: res.pricePerToken,
+          openedAt: Date.now(), txSig: res.signature,
+          entryPriceSolPerToken: res.actualFillPrice,
+          peakPriceSolPerToken: res.actualFillPrice,
+          lastPriceSolPerToken: res.actualFillPrice,
         });
         recordTrade({
-          side: "buy",
-          mint: swap.tokenMint,
-          leader: swap.leader,
-          solDeltaLamports: -res.solLamports,
-          txSig: res.signature,
-          reason: `copy ${swap.leader.slice(0, 6)} · ${res.route}`,
+          side: "buy", mint: swap.tokenMint, leader: swap.leader,
+          solDeltaLamports: -res.solLamports, txSig: res.signature,
+          reason: `copy ${swap.leader.slice(0, 6)} · ${res.route}${res.slippageBps > 0 ? ` · slip ${res.slippageBps}bps` : ""}`,
         });
         markLeaderBought(swap.leader);
         incr("buys_total");
-        notify(
-          `🟢 buy *${swap.tokenMint.slice(0, 6)}…* via ${swap.leader.slice(0, 6)}\nspent ${fmtSol(res.solLamports)} SOL · ${res.route}`,
-        );
+        notify(`🟢 buy *${swap.tokenMint.slice(0, 6)}…* via ${swap.leader.slice(0, 6)}\nspent ${fmtSol(res.solLamports)} SOL · ${res.route}${res.slippageBps > 0 ? ` · ${res.slippageBps}bps slip` : ""}`);
       } else {
         const pos = getPosition(swap.tokenMint, swap.leader);
         if (!pos) return;
         const held = BigInt(pos.amountRaw);
         const soldByLeader = swap.tokenAmountRaw;
         const leaderPre = swap.leaderPreTokenAmount;
-        const fraction =
-          leaderPre > 0n
-            ? Number((soldByLeader * 10000n) / leaderPre) / 10000
-            : 1;
-        const sellAmount =
-          fraction >= 0.95 ? held : BigInt(Math.floor(Number(held) * fraction));
+        const fraction = leaderPre > 0n
+          ? Number((soldByLeader * 10000n) / leaderPre) / 10000 : 1;
+        const sellAmount = fraction >= 0.95 ? held : BigInt(Math.floor(Number(held) * fraction));
         if (sellAmount <= 0n) return;
         const isFullExit = sellAmount === held;
         const res = await sell(conn, kp, swap.tokenMint, sellAmount);
-        const proportionalCost = Math.floor(
-          pos.solSpentLamports * (Number(sellAmount) / Number(held)),
-        );
+        const proportionalCost = Math.floor(pos.solSpentLamports * (Number(sellAmount) / Number(held)));
         if (isFullExit) {
           closePosition(swap.tokenMint, swap.leader);
           markMintSold(swap.tokenMint);
         } else {
-          const remaining = held - sellAmount;
-          const remainingCost = pos.solSpentLamports - proportionalCost;
           updatePositionAmount(
-            swap.tokenMint,
-            swap.leader,
-            remaining.toString(),
-            remainingCost,
+            swap.tokenMint, swap.leader,
+            (held - sellAmount).toString(),
+            pos.solSpentLamports - proportionalCost,
           );
         }
         const realized = res.solLamports - proportionalCost;
         recordTrade({
-          side: "sell",
-          mint: swap.tokenMint,
-          leader: swap.leader,
-          solDeltaLamports: realized,
-          txSig: res.signature,
+          side: "sell", mint: swap.tokenMint, leader: swap.leader,
+          solDeltaLamports: realized, txSig: res.signature,
           reason: `follow ${swap.leader.slice(0, 6)} sell${isFullExit ? "" : ` ${(fraction * 100).toFixed(0)}%`} · ${res.route}`,
         });
         incr("sells_total");
-        notify(
-          `🔴 sell *${swap.tokenMint.slice(0, 6)}…* (${isFullExit ? "full" : `${(fraction * 100).toFixed(0)}%`}) via ${swap.leader.slice(0, 6)}\nrealized ${fmtSol(realized)} SOL · ${res.route}`,
-        );
+        notify(`🔴 sell *${swap.tokenMint.slice(0, 6)}…* (${isFullExit ? "full" : `${(fraction * 100).toFixed(0)}%`}) via ${swap.leader.slice(0, 6)}\nrealized ${fmtSol(realized)} SOL · ${res.route}`);
         if (config.autoMuteEnabled) {
           const mute = evaluateAutoMute(swap.leader, {
             minTrades: config.autoMuteMinTrades,
@@ -231,6 +204,8 @@ async function main() {
   const stopPrice = startPriceWatcher(conn, kp);
   const stopDash = config.enableDashboard ? startDashboard(kp.publicKey) : () => {};
   const stopMetrics = startMetrics();
+  const stopQueue = startSellQueue(conn, kp);
+  const stopBalance = startBalanceMonitor(conn, kp.publicKey);
 
   if (config.autoDiscover && config.autoDiscoverRefreshMinutes > 0) {
     setInterval(async () => {
@@ -245,9 +220,7 @@ async function main() {
   const shutdown = async (why: string) => {
     log.info({ why }, "shutting down");
     await stopWatcher();
-    stopPrice();
-    stopDash();
-    stopMetrics();
+    stopPrice(); stopDash(); stopMetrics(); stopQueue(); stopBalance();
     process.exit(0);
   };
   process.on("SIGINT", () => void shutdown("SIGINT"));
@@ -258,7 +231,4 @@ async function main() {
   );
 }
 
-main().catch((err) => {
-  log.fatal({ err }, "fatal");
-  process.exit(1);
-});
+main().catch((err) => { log.fatal({ err }, "fatal"); process.exit(1); });

@@ -11,6 +11,11 @@ import { killSwitchTripped } from "./risk.js";
 import { listMutes } from "./scoring.js";
 import { solUsd } from "./solprice.js";
 import { log } from "./log.js";
+import { getHealth } from "./health.js";
+
+function healthCheck() {
+  return getHealth();
+}
 
 export function startDashboard(walletPubkey: PublicKey): () => void {
   const server = createServer(async (req, res) => {
@@ -18,6 +23,14 @@ export function startDashboard(walletPubkey: PublicKey): () => void {
       const body = JSON.stringify(await snapshot(walletPubkey));
       res.writeHead(200, { "content-type": "application/json" });
       res.end(body); return;
+    }
+    if (req.url === "/healthz") {
+      const ok = healthCheck();
+      res.writeHead(ok.status === "ok" ? 200 : 503, {
+        "content-type": "application/json",
+      });
+      res.end(JSON.stringify(ok));
+      return;
     }
     res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
     res.end(renderPage(walletPubkey));

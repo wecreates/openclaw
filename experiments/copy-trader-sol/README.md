@@ -34,6 +34,18 @@ Solana copy-trading bot. Watches wallets you follow, mirrors their DEX swaps thr
    (stop / trail / age)     (auto-mute losing leaders)     · metrics · CLI · CSV
 ```
 
+## Operational safety (v0.5)
+
+- **Pending swap ledger** — every send is recorded before broadcast (signature + blockhash + last-valid-height). On restart, `recoverPending()` asks the RPC what happened to each: landed cleanly (reconcile picks up on-chain position), confirmed with error, blockhash expired, or still in flight.
+- **Actual fill parsing** — after confirm, we diff our own pre/post SOL + SPL balances to record the *actual* execution price, not the quote's projection. Slippage vs quote is stored on every trade and logged when it exceeds tolerance.
+- **Sell retry queue** — a stop-loss / trailing exit that fails at execute time gets enqueued with exponential backoff (30s → 90s → 5m → 15m → 1h). Background worker processes due items every 15s. Recovers if leader-side selling would have missed the exit.
+- **Orphaned wSOL cleanup** — on startup (unless `WSOL_CLEANUP_ON_START=0`), close the wallet's wSOL ATA if it holds any residual balance from a failed Jupiter swap.
+- **Wallet balance monitor** — polls the trading wallet every N minutes; alerts once per cooldown window when balance drops below threshold.
+- **DB migrations** — versioned schema in `schema_version`. Each migration runs once, in order; safe on both fresh and legacy DBs (`ALTER … ADD COLUMN` failures are swallowed only for "duplicate column").
+- **Log rotation** — set `LOG_FILE=./data/logs/bot.log` and each day's process gets its own `bot.<YYYY-MM-DD>.log`. Terminal output continues via pino-pretty.
+- **/healthz** — Kubernetes-style probe on the dashboard port. Returns `ok`, `degraded` (kill-switch, or price-watcher hasn't ticked in 5 min while positions are open), or `down`.
+- **Historical backtest** — `pnpm backtest trades.json` now uses GeckoTerminal minute candles to compute *actual* PnL, drawdown, best/worst trade, per-exit-reason breakdown. Uses the same stop / trailing TP / max-age exit rules the live bot uses.
+
 ## Feature list
 
 - **Signal** — Helius `logsSubscribe` per followed wallet, 15s RPC heartbeat, full resubscribe on failure.
@@ -115,6 +127,11 @@ Note: Jupiter serves current quotes only, so replay simulates strategy shape (wh
 ## Realistic latency
 
 Leader confirms → your fill: **2–8s** typical without Jito, ~1–3s with Jito bundles + tip. Exits are yours (price-watch loop, not leader-timed).
+
+## Deployment
+
+- **systemd**: `deploy/systemd/copy-trader.service` — copy to `/etc/systemd/system/`, `systemctl enable --now copy-trader`.
+- **Docker**: `deploy/docker/Dockerfile` + `docker-compose.yml`. Multi-stage build, runs as `node` user, healthcheck hits `/healthz`, data persisted in a named volume, bot log rotation via json-file driver.
 
 ## Known limits / possible next rounds
 

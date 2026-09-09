@@ -1,6 +1,7 @@
 import Database from "better-sqlite3";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
+import { runMigrations } from "./migrate.js";
 
 const DB_PATH = process.env.DB_PATH ?? "./data/state.db";
 mkdirSync(dirname(DB_PATH), { recursive: true });
@@ -38,6 +39,8 @@ db.exec(`
     at INTEGER NOT NULL
   );
 `);
+
+runMigrations(db);
 
 export type Position = {
   mint: string;

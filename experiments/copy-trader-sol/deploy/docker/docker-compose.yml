@@ -1,0 +1,21 @@
+services:
+  copy-trader:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+    container_name: copy-trader
+    restart: unless-stopped
+    env_file: ../../.env
+    ports:
+      - "127.0.0.1:3000:3000"   # dashboard
+      - "127.0.0.1:9090:9090"   # /metrics
+    volumes:
+      - copy-trader-data:/app/data
+    stop_signal: SIGINT
+    stop_grace_period: 20s
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "5" }
+
+volumes:
+  copy-trader-data:

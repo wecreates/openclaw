@@ -94,6 +94,14 @@ export const config = {
   metricsPort: num("METRICS_PORT", 9090),
   enableMetrics: bool("ENABLE_METRICS", true),
 
+  walletBalanceAlertSol: num("WALLET_BALANCE_ALERT_SOL", 0.05),
+  balanceCheckIntervalMinutes: num("BALANCE_CHECK_INTERVAL_MINUTES", 10),
+  balanceAlertCooldownHours: num("BALANCE_ALERT_COOLDOWN_HOURS", 6),
+
+  wsolCleanupOnStart: bool("WSOL_CLEANUP_ON_START", true),
+
+  logFile: opt("LOG_FILE"),
+
   dryRun: bool("DRY_RUN", true),
   logLevel: process.env.LOG_LEVEL ?? "info",
 } as const;
