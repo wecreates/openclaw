@@ -1,0 +1,28 @@
+{
+  "name": "copy-trader-sol",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Copy-trade the wallets on Solana that you follow. Mirrors their buys and sells through Jupiter.",
+  "scripts": {
+    "build": "tsc",
+    "start": "node --enable-source-maps dist/index.js",
+    "dev": "tsx src/index.ts",
+    "backtest": "tsx src/backtest.ts"
+  },
+  "dependencies": {
+    "@solana/web3.js": "^1.95.3",
+    "bs58": "^6.0.0",
+    "better-sqlite3": "^11.3.0",
+    "dotenv": "^16.4.5",
+    "pino": "^9.4.0",
+    "pino-pretty": "^11.2.2",
+    "undici": "^6.19.8"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.11",
+    "@types/node": "^22.5.4",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.2"
+  }
+}
