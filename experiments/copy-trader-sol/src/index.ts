@@ -23,6 +23,9 @@ import { resolveWallets } from "./discovery.js";
 import { startPriceWatcher } from "./pricewatch.js";
 import { startDashboard } from "./dashboard.js";
 import { fmtSol, notify } from "./notify.js";
+import { reconcilePositions } from "./reconcile.js";
+import { isBlockingRug, rugCheck } from "./rugcheck.js";
+import { evaluateAutoMute, isMuted } from "./scoring.js";
 
 async function main() {
   const kp = loadKeypair();
@@ -44,6 +47,8 @@ async function main() {
     process.exit(1);
   }
 
+  await reconcilePositions(conn, kp.publicKey);
+
   let wallets = await resolveWallets();
   if (wallets.length === 0) {
     log.fatal("no wallets to follow after discovery");
@@ -52,9 +57,13 @@ async function main() {
   log.info({ count: wallets.length }, "resolved followed wallets");
 
   const stopWatcher = watchWallets(conn, wallets, async (swap) => {
+    if (isMuted(swap.leader)) {
+      log.info({ leader: swap.leader }, "skipping: leader muted");
+      return;
+    }
     const gate = preTradeGate(swap.side);
     if (gate) {
-      log.warn({ reason: gate, swap: swap.tokenMint }, "skipping");
+      log.warn({ reason: gate, mint: swap.tokenMint }, "skipping");
       return;
     }
     if (isBlacklisted(swap.tokenMint)) {
@@ -71,6 +80,18 @@ async function main() {
           );
           return;
         }
+
+        if (config.rugCheckEnabled) {
+          const rug = await rugCheck(conn, swap.tokenMint);
+          if (isBlockingRug(rug)) {
+            log.warn({ mint: swap.tokenMint, reasons: rug.reasons }, "skipping: rug check failed");
+            notify(
+              `⚠️ skipped *${swap.tokenMint.slice(0, 6)}…*\nrug: ${rug.reasons.join("; ")}`,
+            );
+            return;
+          }
+        }
+
         if (!(await passesLiquidity(swap.tokenMint))) {
           log.info({ mint: swap.tokenMint }, "skipping: illiquid");
           return;
@@ -128,13 +149,14 @@ async function main() {
         }
         const isFullExit = sellAmount === held;
         const res = await sell(conn, kp, swap.tokenMint, sellAmount);
+        const proportionalCost = Math.floor(
+          pos.solSpentLamports * (Number(sellAmount) / Number(held)),
+        );
         if (isFullExit) {
           closePosition(swap.tokenMint, swap.leader);
         } else {
           const remaining = held - sellAmount;
-          const remainingCost = Math.floor(
-            pos.solSpentLamports * (1 - Number(sellAmount) / Number(held)),
-          );
+          const remainingCost = pos.solSpentLamports - proportionalCost;
           updatePositionAmount(
             swap.tokenMint,
             swap.leader,
@@ -142,12 +164,7 @@ async function main() {
             remainingCost,
           );
         }
-        const realized = isFullExit
-          ? res.solLamports - pos.solSpentLamports
-          : res.solLamports -
-            Math.floor(
-              pos.solSpentLamports * (Number(sellAmount) / Number(held)),
-            );
+        const realized = res.solLamports - proportionalCost;
         recordTrade({
           side: "sell",
           mint: swap.tokenMint,
@@ -159,6 +176,17 @@ async function main() {
         notify(
           `🔴 sell *${swap.tokenMint.slice(0, 6)}…* (${isFullExit ? "full" : `${(fraction * 100).toFixed(0)}%`}) via ${swap.leader.slice(0, 6)}\nrealized ${fmtSol(realized)} SOL`,
         );
+        if (config.autoMuteEnabled) {
+          const mute = evaluateAutoMute(swap.leader, {
+            minTrades: config.autoMuteMinTrades,
+            winRateFloor: config.autoMuteWinRateFloor,
+            maxLossStreak: config.autoMuteLossStreak,
+          });
+          if (mute.muted) {
+            log.warn({ leader: swap.leader, reason: mute.reason }, "auto-muted leader");
+            notify(`🔇 muted ${swap.leader.slice(0, 6)}: ${mute.reason}`);
+          }
+        }
       }
     } catch (err) {
       log.error({ err, swap }, "execution failed");
@@ -174,11 +202,11 @@ async function main() {
   if (config.autoDiscover && config.autoDiscoverRefreshMinutes > 0) {
     setInterval(async () => {
       const fresh = await resolveWallets();
-      if (fresh.length > wallets.length || fresh.some((w) => !wallets.includes(w))) {
+      if (fresh.length !== wallets.length || fresh.some((w) => !wallets.includes(w))) {
         log.info({ before: wallets.length, after: fresh.length }, "wallet list changed — restart to apply");
         wallets = fresh;
       }
-    }, config.autoDiscoverRefreshMinutes * 60_000);
+    }, config.autoDiscoverRefreshMinutes * 60_000).unref();
   }
 
   const shutdown = async (why: string) => {

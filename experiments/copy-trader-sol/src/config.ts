@@ -61,6 +61,13 @@ export const config = {
 
   minLeaderSolLamports: num("MIN_LEADER_SOL_LAMPORTS", 100_000_000),
 
+  rugCheckEnabled: bool("RUG_CHECK_ENABLED", true),
+
+  autoMuteEnabled: bool("AUTO_MUTE_ENABLED", true),
+  autoMuteMinTrades: num("AUTO_MUTE_MIN_TRADES", 5),
+  autoMuteWinRateFloor: num("AUTO_MUTE_WIN_RATE_FLOOR", 0.35),
+  autoMuteLossStreak: num("AUTO_MUTE_LOSS_STREAK", 4),
+
   killSwitchPath:
     opt("KILL_SWITCH_PATH") ?? `${process.env.HOME ?? ""}/.copy-trader-kill`,
 

@@ -1,92 +1,105 @@
 # copy-trader-sol
 
-Solana copy-trading bot. Watches wallets you follow, mirrors their DEX swaps through Jupiter, protects downside with stop-loss + trailing take-profit, and shows a live dashboard.
+Solana copy-trading bot. Watches wallets you follow, mirrors their DEX swaps through Jupiter, protects downside with stop-loss + trailing take-profit, drops leaders who cost you money, and shows a live dashboard.
 
 ## Architecture
 
 ```
-Helius WS → parser → risk gate → Jupiter v6 swap → sqlite state → dashboard
-   ↑                                                    ↓
-followed wallets                                 price watcher → stop-loss / trailing TP
+Helius WS (auto-reconnect) → parser → risk gate → Jupiter v6 swap → sqlite
+      ↑                                       ↑                        ↓
+followed wallets              rug check · liquidity            price watcher
+      ↑                       min leader size                  · stop-loss
+GMGN top wallets              blacklist · kill switch          · trailing TP
+                              muted leaders                      · exits
+                                                                    ↓
+                                                            leader scorer
+                                                                    ↓
+                                                            auto-mute losers
 ```
 
-- **Watcher**: `logsSubscribe({ mentions: [wallet] })`. Latency ~1–3 slots (400ms–1.2s) after leader's tx confirms.
-- **Parser**: diffs leader's pre/post SOL and SPL balances — works on any DEX (Jupiter, Raydium, Pump.fun, Meteora, Orca).
-- **Execution**: Jupiter v6 aggregator routes across every Solana DEX.
-- **Exits**: independent price-watch loop polls Jupiter every 20s per open position; fires stop-loss or trailing take-profit without waiting for the leader.
-- **Kill switch**: create the file at `$KILL_SWITCH_PATH` (default `~/.copy-trader-kill`) and no new trades fire until you delete it.
-- **Dashboard**: http://127.0.0.1:3000 — auto-refresh every 5s.
+- **Watcher** — `logsSubscribe({ mentions: [wallet] })` with a 15s heartbeat and full resubscribe on RPC failure.
+- **Parser** — diffs the leader's pre/post SOL and SPL balances, DEX-agnostic. Returns `leaderPre/PostTokenAmount` so partial sells scale correctly.
+- **Rug check** — before every buy: mint authority must be null (no printing), freeze authority must be null (no wallet freeze), top holder <40%.
+- **Execution** — Jupiter v6 aggregator with priority fee; retrying HTTP wrapper handles transient 5xx/timeouts.
+- **Reconciliation on startup** — walks every open position and syncs its `amount_raw` with the wallet's on-chain balance (drops phantoms, adjusts partials).
+- **Exits** — 20s price poll per open position; independent stop-loss + trailing take-profit.
+- **Auto-mute** — after N closed sells, if a leader's net PnL is negative AND (winrate below floor OR loss streak), they're muted and won't be copied again.
+- **Kill switch** — create `~/.copy-trader-kill`; no new trades until you delete it.
+- **Dashboard** — http://127.0.0.1:3000, 5s refresh.
+- **CLI** — `pnpm cli status | positions | trades | leaders | mute | unmute | mutes`.
 
 ## First night — from zero to running
 
 ```bash
-# 1. Install
-pnpm install --ignore-workspace   # or npm install / bun install
-pnpm smoke                        # parser tests, no network
+pnpm install --ignore-workspace
+pnpm test                          # 16 unit tests, no network
+pnpm setup                         # interactive: writes .env, can generate a wallet
 
-# 2. Interactive setup (generates .env, optionally a fresh wallet)
-pnpm setup
+# fund the wallet address the setup script prints with SOL you can afford to lose
 
-# 3. Fund the trading wallet with a small amount of SOL you can afford to lose.
-#    The setup script prints the public address after generating the keypair.
-
-# 4. Run in dry-run (default) and watch the dashboard for a full day
-pnpm dev
+pnpm dev                           # DRY_RUN=1 by default
 open http://127.0.0.1:3000
 
-# 5. When the dry-run log looks sane and you've seen a few leader trades echoed:
-#    edit .env → DRY_RUN=0
-pnpm dev
+# in another terminal:
+pnpm cli status                    # PnL & open positions
+pnpm cli leaders                   # per-leader stats
+pnpm cli mute <addr> reason        # manually drop a leader
 
-# panic button, at any time:
+# after ~24h of clean dry-run: edit .env → DRY_RUN=0, pnpm dev
+
+# panic button, any time:
 touch ~/.copy-trader-kill
 ```
 
-## What you'll see
+## Environment cheatsheet
 
-- Terminal: pino-pretty logs — `leader swap detected`, `DRY_RUN quote` (in dry mode), `swap sent`, `auto-exit triggered`.
-- Dashboard: PnL 24h / all-time, open positions with live PnL %, recent trades.
-- Telegram (if configured): every buy, sell, and auto-exit.
-
-## Finding wallets
-
-- **AUTO_DISCOVER=1** — pulls top 7-day PnL wallets from GMGN's public rank endpoint (filtered to >55% win rate). Endpoint shape may shift; failure falls back to your static list.
-- **Manual** — GMGN.ai Smart Money tab, Cielo Finance, Birdeye "Top Traders per token". Add addresses to `FOLLOWED_WALLETS`.
-
-Follow 3–8 across different styles. Copying one wallet correlates you 1:1 with its bad day.
-
-## Safety design
-
-| feature | env | what it prevents |
+| var | default | effect |
 |---|---|---|
-| Dry run | `DRY_RUN=1` | Sends nothing; logs decisions |
-| Stop-loss | `STOP_LOSS_PCT=0.30` | Leader bag-holds to zero |
-| Trailing TP | `TAKE_PROFIT_PCT=1.0` + `TRAILING_STOP_PCT=0.20` | Round-trip a winner |
-| Max positions | `MAX_CONCURRENT_POSITIONS=5` | Over-exposure on a fast day |
-| Daily loss cap | `DAILY_LOSS_LIMIT_SOL=0.5` | Bot pauses itself |
-| Min leader size | `MIN_LEADER_SOL_LAMPORTS` | Skip leader's dust probes |
-| Liquidity probe | `MIN_LIQUIDITY_USD` | Skip rugs/honeypots (>5% impact on 0.1 SOL) |
-| Blacklist | `BLACKLIST_MINTS` | Never touch a mint you've seen scam |
-| Kill switch | touch `~/.copy-trader-kill` | Instant pause without shutdown |
-
-## Partial sells
-
-When the leader sells `X%` of their position, we sell the same `X%` of ours (rounded to 100% if ≥95%). Parser reads their pre-tx balance from the transaction meta, so this works without a separate balance query.
+| `DRY_RUN` | `1` | Send no transactions |
+| `FIXED_BUY_SOL` | `0.02` | SOL per copied buy (overrides percent) |
+| `LEADER_PERCENT` | `0` | Or copy N% of leader's SOL notional |
+| `MAX_CONCURRENT_POSITIONS` | `5` | Hard cap |
+| `MIN_LEADER_SOL_LAMPORTS` | `1e8` | Skip leader's dust buys (<0.1 SOL) |
+| `STOP_LOSS_PCT` | `0.30` | Exit if -30% from entry |
+| `TAKE_PROFIT_PCT` | `1.0` | Arm trailing stop at +100% |
+| `TRAILING_STOP_PCT` | `0.20` | Exit if -20% off peak once TP armed |
+| `PRICE_CHECK_INTERVAL_SEC` | `20` | Price-watch cadence |
+| `DAILY_LOSS_LIMIT_SOL` | `0.5` | Bot pauses itself |
+| `SLIPPAGE_BPS` | `150` | 1.5% |
+| `PRIORITY_FEE_MICROLAMPORTS` | `100000` | Higher = faster inclusion |
+| `RUG_CHECK_ENABLED` | `1` | Block mintable/freezable/concentrated tokens |
+| `AUTO_MUTE_ENABLED` | `1` | Drop leaders who lose money |
+| `AUTO_MUTE_MIN_TRADES` | `5` | Sample size before muting |
+| `AUTO_MUTE_WIN_RATE_FLOOR` | `0.35` | Auto-mute below this winrate |
+| `AUTO_MUTE_LOSS_STREAK` | `4` | Or after this many consecutive losers |
+| `BLACKLIST_MINTS` | `` | Comma-separated mints never to touch |
+| `KILL_SWITCH_PATH` | `~/.copy-trader-kill` | Touch this file to pause |
+| `AUTO_DISCOVER` | `0` | Pull top wallets from GMGN |
+| `AUTO_DISCOVER_COUNT` | `5` | Number of wallets to pull |
+| `AUTO_DISCOVER_REFRESH_MINUTES` | `240` | Refresh cadence |
+| `TELEGRAM_BOT_TOKEN` / `_CHAT_ID` | `` | Optional Telegram alerts |
+| `DASHBOARD_PORT` | `3000` | HTTP dashboard |
 
 ## Realistic latency
 
 Leader confirms → your fill: **2–8s** typical. If a token 20xes in 30s the leader still beats you. This is not front-running; it's late mirror. Your exits are yours, though — they run on your price-watch loop, not the leader's timing.
 
-## Known limits
+## Testing
 
-- Auto-discovery scrapes a public endpoint; a paid Cielo/Nansen key is more stable long-term.
-- No Jito bundles yet — swap `sendRawTransaction` for a bundle submit if you need sub-slot inclusion.
-- Single RPC. For real speed run two connections and race log events.
-- No paper-simulation of stop-loss during dry-run (only real Jupiter quotes are polled).
-- If you restart mid-position, the entry price persists but any live orders that need re-attempting won't retry automatically.
+- `pnpm test` — Vitest suite: parser (buy/sell/partial/failed-tx/edge cases), scoring (auto-mute logic), http (retry & non-retry).
+- `pnpm smoke` — legacy parser assertions via tsx.
+- `pnpm typecheck` — full project.
+
+## Known limits / next up
+
+- **Jito bundles** — swap `sendRawTransaction` for a Jito bundle submit for sub-slot inclusion.
+- **Multi-RPC racing** — run two providers and take whichever confirms first.
+- **Backtest** — replay leader txs against Jupiter's price history. Big project.
+- **Fresh-token gate** — no `getSignaturesForAddress` age check yet; consider skipping tokens <5 minutes old.
+- **Cost basis** — currently proportional per partial sell; not full FIFO.
 
 ## Warnings
 
-- Base58 secret keys are as dangerous as your seed phrase. Use a fresh wallet, fund with what you can lose.
-- Copy-trading has known adverse selection: by the time you enter, price has already moved against you. Expect worse fills than the leader's reported PnL. A 60% win-rate leader may map to a break-even bot after slippage and fees.
-- This is a starting point, not a strategy. Paper-trade for at least 24h and start with 0.01–0.02 SOL per trade.
+- Base58 secret keys are as dangerous as your seed phrase. Fresh wallet, funded with what you can lose.
+- Copy-trading has adverse selection: by the time you enter, price has already moved against you. A 60% win-rate leader can map to a break-even bot after slippage and fees.
+- Start with `FIXED_BUY_SOL=0.01`. Don't scale up until you've seen 20+ real trades survive.

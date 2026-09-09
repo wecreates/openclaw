@@ -1,15 +1,18 @@
 {
   "name": "copy-trader-sol",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "type": "module",
-  "description": "Copy-trade Solana wallets you follow. Mirrors buys and sells through Jupiter with stop-loss, trailing take-profit, kill-switch, and a live dashboard.",
+  "description": "Copy-trade Solana wallets you follow. Jupiter-routed swaps, stop-loss + trailing take-profit, rug check, auto-mute losing leaders, kill switch, live dashboard, CLI.",
   "scripts": {
     "setup": "tsx src/setup.ts",
     "build": "tsc",
     "start": "node --enable-source-maps dist/index.js",
     "dev": "tsx src/index.ts",
+    "cli": "tsx src/cli.ts",
     "smoke": "tsx src/smoke.ts",
+    "test": "vitest run",
+    "test:watch": "vitest",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
@@ -25,6 +28,7 @@
     "@types/better-sqlite3": "^7.6.11",
     "@types/node": "^22.5.4",
     "tsx": "^4.19.0",
-    "typescript": "^5.6.2"
+    "typescript": "^5.6.2",
+    "vitest": "^2.1.1"
   }
 }

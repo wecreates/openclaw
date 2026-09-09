@@ -1,4 +1,4 @@
-import { request } from "undici";
+import { fetchJson } from "./http.js";
 
 const QUOTE_URL = "https://quote-api.jup.ag/v6/quote";
 const SWAP_URL = "https://quote-api.jup.ag/v6/swap";
@@ -28,11 +28,7 @@ export async function quote(args: {
   url.searchParams.set("swapMode", "ExactIn");
   url.searchParams.set("onlyDirectRoutes", "false");
   url.searchParams.set("asLegacyTransaction", "false");
-  const res = await request(url.toString());
-  if (res.statusCode !== 200) {
-    throw new Error(`Jupiter quote ${res.statusCode}: ${await res.body.text()}`);
-  }
-  return (await res.body.json()) as QuoteResponse;
+  return fetchJson<QuoteResponse>(url.toString(), { retries: 3, timeoutMs: 6000 });
 }
 
 export async function buildSwapTx(args: {
@@ -52,14 +48,12 @@ export async function buildSwapTx(args: {
       },
     },
   };
-  const res = await request(SWAP_URL, {
+  const j = await fetchJson<{ swapTransaction: string }>(SWAP_URL, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(body),
+    retries: 2,
+    timeoutMs: 10000,
   });
-  if (res.statusCode !== 200) {
-    throw new Error(`Jupiter swap ${res.statusCode}: ${await res.body.text()}`);
-  }
-  const j = (await res.body.json()) as { swapTransaction: string };
   return j.swapTransaction;
 }
