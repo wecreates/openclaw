@@ -71,6 +71,18 @@ export const config = {
   leaderRebuyCooldownMinutes: num("LEADER_REBUY_COOLDOWN_MINUTES", 5),
 
   rugCheckEnabled: bool("RUG_CHECK_ENABLED", true),
+  enhancedRugCheckEnabled: bool("ENHANCED_RUG_CHECK_ENABLED", true),
+  minVolume24hUsd: num("MIN_VOLUME_24H_USD", 5_000),
+  minPoolAgeMinutes: num("MIN_POOL_AGE_MINUTES", 15),
+
+  priorityFeeDynamic: bool("PRIORITY_FEE_DYNAMIC", false),
+
+  maxPercentPerMint: num("MAX_PERCENT_PER_MINT", 0.4),
+  maxPercentPerLeader: num("MAX_PERCENT_PER_LEADER", 0.5),
+
+  buyQueueTtlSec: num("BUY_QUEUE_TTL_SEC", 60),
+
+  alertDedupWindowSec: num("ALERT_DEDUP_WINDOW_SEC", 300),
 
   autoMuteEnabled: bool("AUTO_MUTE_ENABLED", true),
   autoMuteMinTrades: num("AUTO_MUTE_MIN_TRADES", 5),

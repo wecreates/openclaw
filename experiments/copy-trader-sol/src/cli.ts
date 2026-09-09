@@ -12,6 +12,9 @@ import {
   unmuteLeader,
 } from "./scoring.js";
 import { exportTradesCsv } from "./export.js";
+import { perHourOfDay, perLeader, perMint } from "./analytics.js";
+import { buyQueueDepth } from "./buyqueue.js";
+import { queueDepth as sellQueueDepth } from "./sellqueue.js";
 
 const cmd = process.argv[2] ?? "status";
 const args = process.argv.slice(3);
@@ -36,6 +39,8 @@ async function main(): Promise<void> {
       console.log(`open positions: ${positions.length}`);
       console.log(`PnL 24h:  ${fmt(pnlLast24hLamports())}`);
       console.log(`PnL all:  ${fmt(totalPnlLamports())}`);
+      console.log(`buy queue:  ${buyQueueDepth()}`);
+      console.log(`sell queue: ${sellQueueDepth()}`);
       break;
     }
     case "positions": {
@@ -107,6 +112,24 @@ async function main(): Promise<void> {
       console.log(`wrote ${n} trades to ${path}`);
       break;
     }
+    case "analyze": {
+      const scope = args[0] ?? "leaders";
+      const rows: string[][] = [["KEY", "TRADES", "WIN%", "NET"]];
+      const data =
+        scope === "mints" ? perMint()
+        : scope === "hours" ? perHourOfDay()
+        : perLeader();
+      for (const s of data) {
+        rows.push([
+          scope === "hours" ? s.key : short(s.key),
+          String(s.trades),
+          `${(s.winRate * 100).toFixed(0)}%`,
+          fmt(s.netLamports),
+        ]);
+      }
+      console.log(table(rows));
+      break;
+    }
     default:
       console.log([
         "Commands:",
@@ -118,6 +141,7 @@ async function main(): Promise<void> {
         "  pnpm cli unmute <leader>",
         "  pnpm cli mutes",
         "  pnpm cli export [path.csv]",
+        "  pnpm cli analyze [leaders|mints|hours]",
       ].join("\n"));
   }
 }

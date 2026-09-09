@@ -10,6 +10,7 @@ import { sendJitoBundle } from "./jito.js";
 import { raceSend, raceSendersReady } from "./rpc.js";
 import { incr } from "./metrics.js";
 import { clearPending, recordPending } from "./pendingswap.js";
+import { dynamicPriorityFee } from "./priorityfee.js";
 
 export type ExecResult = {
   signature: string | null;
@@ -63,7 +64,7 @@ async function swap(
     };
   }
 
-  let priorityFee = config.priorityFeeMicrolamports;
+  let priorityFee = await dynamicPriorityFee(config.priorityFeeMicrolamports);
   let lastErr: Error | null = null;
   for (let attempt = 0; attempt < config.executionMaxAttempts; attempt++) {
     try {

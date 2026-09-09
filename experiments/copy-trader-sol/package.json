@@ -1,6 +1,6 @@
 {
   "name": "copy-trader-sol",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "private": true,
   "type": "module",
   "description": "Copy-trade Solana wallets. Jupiter routing + optional Jito bundles + multi-RPC racing. Stop-loss, trailing take-profit, position-age exit, consensus, cooldowns, rug check, auto-mute, kill switch, live dashboard, Prometheus metrics, CSV export.",

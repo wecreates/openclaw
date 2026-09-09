@@ -34,6 +34,16 @@ Solana copy-trading bot. Watches wallets you follow, mirrors their DEX swaps thr
    (stop / trail / age)     (auto-mute losing leaders)     · metrics · CLI · CSV
 ```
 
+## Deeper safety and analytics (v0.6)
+
+- **Enhanced rug check** — the on-chain mint/freeze/top-holder check is now layered with a GeckoTerminal pool query: reserve floor, 24h volume floor, minimum pool age, low-GT-score suspicion. Blocking rug reasons emit deduplicated Telegram/Discord alerts.
+- **Buy retry queue** — a failed initial buy is enqueued with a short TTL (60s default) and 3 backoff attempts (5s → 15s → 30s). Stale signals drop; successful retries land normally and mark the leader cooldown.
+- **Dynamic priority fee** — set `PRIORITY_FEE_DYNAMIC=1` and every swap asks Helius's `getPriorityFeeEstimate` for the "high" percentile, capped by `PRIORITY_FEE_MICROLAMPORTS_MAX`, cached for 3s. Falls back silently to the static value on failure.
+- **Portfolio allocation gates** — `MAX_PERCENT_PER_MINT` and `MAX_PERCENT_PER_LEADER` (fractions of invested SOL notional). First position always passes (otherwise a single-position portfolio would always block).
+- **Alert dedup** — `notifyDedup(key, msg)` collapses repeat alerts under the same key within a window, then emits a summary line ("and N more rug-skip in the last 300s") when the window closes.
+- **Analytics** — `pnpm cli analyze [leaders|mints|hours]` — per-key trade count, winrate, net PnL. Hour-of-day is UTC-bucketed, useful for spotting session-window effects (US, Asia, EU).
+- **Status CLI now shows queue depth** — `pnpm cli status` includes buy + sell queue lengths.
+
 ## Operational safety (v0.5)
 
 - **Pending swap ledger** — every send is recorded before broadcast (signature + blockhash + last-valid-height). On restart, `recoverPending()` asks the RPC what happened to each: landed cleanly (reconcile picks up on-chain position), confirmed with error, blockhash expired, or still in flight.

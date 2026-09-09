@@ -41,6 +41,10 @@ import { unwrapStrayWsol } from "./wsol.js";
 import { startSellQueue } from "./sellqueue.js";
 import { startBalanceMonitor } from "./balancemon.js";
 import { markLeaderSwap } from "./health.js";
+import { enhancedRugCheck, isBlockingEnhancedRug } from "./rugcheck2.js";
+import { allocationCheck } from "./allocation.js";
+import { notifyDedup } from "./alertdedupe.js";
+import { enqueueBuy, startBuyQueue } from "./buyqueue.js";
 
 async function main() {
   const kp = loadKeypair();
@@ -110,11 +114,24 @@ async function main() {
           incr("skipped_token_age_total"); return;
         }
 
-        if (config.rugCheckEnabled) {
+        if (config.enhancedRugCheckEnabled) {
+          const rug = await enhancedRugCheck(conn, swap.tokenMint);
+          if (isBlockingEnhancedRug(rug)) {
+            log.warn({ mint: swap.tokenMint, reasons: rug.reasons }, "skipping: enhanced rug check");
+            notifyDedup(
+              "rug-skip",
+              `⚠️ skipped *${swap.tokenMint.slice(0, 6)}…*\n${rug.reasons.join("; ")}`,
+            );
+            incr("skipped_rug_total"); return;
+          }
+        } else if (config.rugCheckEnabled) {
           const rug = await rugCheck(conn, swap.tokenMint);
           if (isBlockingRug(rug)) {
             log.warn({ mint: swap.tokenMint, reasons: rug.reasons }, "skipping: rug check failed");
-            notify(`⚠️ skipped *${swap.tokenMint.slice(0, 6)}…*\nrug: ${rug.reasons.join("; ")}`);
+            notifyDedup(
+              "rug-skip",
+              `⚠️ skipped *${swap.tokenMint.slice(0, 6)}…*\nrug: ${rug.reasons.join("; ")}`,
+            );
             incr("skipped_rug_total"); return;
           }
         }
@@ -132,7 +149,29 @@ async function main() {
 
         const size = sizeBuyLamports(swap.solLamports);
         if (size <= 0) { log.warn("skipping: no sizing configured"); return; }
-        const res = await buy(conn, kp, swap.tokenMint, size);
+
+        const alloc = allocationCheck({ mint: swap.tokenMint, leader: swap.leader, sizeLamports: size });
+        if (!alloc.ok) {
+          log.info({ mint: swap.tokenMint, reason: alloc.reason }, "skipping: allocation cap");
+          incr("skipped_allocation_total"); return;
+        }
+
+        let res;
+        try {
+          res = await buy(conn, kp, swap.tokenMint, size);
+        } catch (err) {
+          log.warn(
+            { mint: swap.tokenMint, err: (err as Error).message },
+            "buy failed — enqueuing for short retry",
+          );
+          incr("buy_deferred_total");
+          enqueueBuy({
+            mint: swap.tokenMint, leader: swap.leader,
+            sizeLamports: size, signalTs: Date.now(),
+            reason: `initial fail: ${(err as Error).message.slice(0, 60)}`,
+          });
+          return;
+        }
         openPosition({
           mint: swap.tokenMint, leader: swap.leader,
           amountRaw: res.tokenAmountRaw.toString(),
@@ -204,7 +243,8 @@ async function main() {
   const stopPrice = startPriceWatcher(conn, kp);
   const stopDash = config.enableDashboard ? startDashboard(kp.publicKey) : () => {};
   const stopMetrics = startMetrics();
-  const stopQueue = startSellQueue(conn, kp);
+  const stopSellQueue = startSellQueue(conn, kp);
+  const stopBuyQueue = startBuyQueue(conn, kp);
   const stopBalance = startBalanceMonitor(conn, kp.publicKey);
 
   if (config.autoDiscover && config.autoDiscoverRefreshMinutes > 0) {
@@ -220,7 +260,7 @@ async function main() {
   const shutdown = async (why: string) => {
     log.info({ why }, "shutting down");
     await stopWatcher();
-    stopPrice(); stopDash(); stopMetrics(); stopQueue(); stopBalance();
+    stopPrice(); stopDash(); stopMetrics(); stopSellQueue(); stopBuyQueue(); stopBalance();
     process.exit(0);
   };
   process.on("SIGINT", () => void shutdown("SIGINT"));
